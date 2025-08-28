@@ -416,3 +416,751 @@ kubectl -n prod port-forward svc/api-svc 8080:8080
 ---
 
 If you want, I can turn this into a ready-to-run **Helm chart** (with values for HPA, PDB, probes, NetworkPolicies, PSA labels, and Kustomize overlays) or tailor these snippets to your stack (Ingress controller, CNI, cloud, and CI/CD).
+
+
+Perfect—here’s a **production-grade Helm chart** you can drop into a repo and install. It bakes in HPA, PDB, probes, NetworkPolicy, PSA labels, Prometheus scrape hints, config/secret checksums, and canary/blue-green hooks via values.
+
+---
+
+# Repo layout
+
+```
+k8s-app-chart/
+├─ Chart.yaml
+├─ values.yaml
+├─ values-prod.yaml         # example prod overrides
+├─ templates/
+│  ├─ _helpers.tpl
+│  ├─ deployment.yaml
+│  ├─ service.yaml
+│  ├─ ingress.yaml
+│  ├─ hpa.yaml
+│  ├─ pdb.yaml
+│  ├─ configmap.yaml
+│  ├─ secret.yaml
+│  ├─ networkpolicy.yaml
+│  ├─ serviceaccount.yaml
+│  ├─ rbac.yaml
+│  ├─ servicemonitor.yaml
+│  └─ NOTES.txt
+└─ .helmignore
+```
+
+---
+
+# Chart.yaml
+
+```yaml
+apiVersion: v2
+name: k8s-app-chart
+description: Production-ready app chart with HPA, PDB, NetworkPolicy, and observability
+type: application
+version: 0.1.0
+appVersion: "1.2.3"
+kubeVersion: ">=1.26.0-0"
+```
+
+# .helmignore
+
+```gitignore
+.git/
+.gitignore
+README.md
+*.swp
+*.bak
+.DS_Store
+```
+
+---
+
+# values.yaml (editable defaults)
+
+```yaml
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 3
+
+image:
+  repository: ghcr.io/org/api
+  tag: "1.2.3"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []     # e.g., [{ name: regcred }]
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+rbac:
+  create: true
+  rulesReadOnly:
+    - apiGroups: [""]
+      resources: ["pods","services","endpoints","configmaps"]
+      verbs: ["get","list","watch"]
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile: { type: RuntimeDefault }
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  hosts:
+    - host: api.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - hosts: ["api.example.com"]
+      secretName: tls-api
+
+resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    cpu: "1"
+    memory: "512Mi"
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+# Example:
+# topologySpreadConstraints:
+# - maxSkew: 1
+#   topologyKey: topology.kubernetes.io/zone
+#   whenUnsatisfiable: ScheduleAnyway
+#   labelSelector: {}
+
+env:            # key=val pairs -> env vars
+  APP_LOG_LEVEL: info
+  APP_FEATURE_X: "true"
+
+envFromSecret: []  # e.g., ["db-secret"] if you already have existing secrets
+
+config:
+  enabled: true
+  data:
+    application.yaml: |
+      server:
+        port: 8080
+      featureX: true
+
+secret:
+  enabled: true
+  stringData:
+    DATABASE_URL: "postgres://user:pass@postgres:5432/app"
+
+probes:
+  readiness:
+    httpGet: { path: /healthz/ready, port: 8080 }
+    periodSeconds: 5
+    failureThreshold: 2
+  liveness:
+    httpGet: { path: /healthz/live, port: 8080 }
+    initialDelaySeconds: 30
+  startup:
+    httpGet: { path: /healthz/startup, port: 8080 }
+    failureThreshold: 30
+    periodSeconds: 2
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    # - type: Pods
+    #   pods:
+    #     metric: { name: http_requests_per_second }
+    #     target: { type: AverageValue, averageValue: "50" }
+
+pdb:
+  enabled: true
+  minAvailable: 2
+
+networkPolicy:
+  enabled: true
+  defaultDeny: true
+  allowNamespaceSelectors: []  # list of labelSelectors to allow ingress from
+  allowFromPods: []            # list of { matchLabels: {...} }
+  allowToPorts:
+    - port: 5432
+      protocol: TCP
+  egressCIDRs: []              # e.g., ["0.0.0.0/0"] if you need outbound internet
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+
+podSecurityAdmission:
+  labels:
+    enforce: "restricted"
+    version: "latest"
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+    maxSurge: 1
+
+extraInitContainers: []   # full container specs
+extraContainers: []       # sidecars
+extraVolumes: []
+extraVolumeMounts: []
+
+deploymentAnnotations: {}
+deploymentLabels: {}
+
+# Canary / blue-green hints (used in labels/selectors)
+color: "blue"   # switch to "green" during cutover
+```
+
+---
+
+# values-prod.yaml (example overrides for prod)
+
+```yaml
+replicaCount: 6
+image:
+  tag: "1.2.4"
+resources:
+  requests: { cpu: "500m", memory: "512Mi" }
+  limits:   { cpu: "2",    memory: "1Gi" }
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: api.yourdomain.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - hosts: ["api.yourdomain.com"]
+      secretName: tls-api
+networkPolicy:
+  allowFromPods:
+    - matchLabels: { app: gateway }
+  allowToPorts:
+    - port: 5432
+      protocol: TCP
+serviceMonitor:
+  enabled: true
+autoscaling:
+  minReplicas: 6
+  maxReplicas: 60
+```
+
+---
+
+# templates/\_helpers.tpl
+
+```yaml
+{{- define "k8s-app-chart.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{- define "k8s-app-chart.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name (include "k8s-app-chart.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end }}
+
+{{- define "k8s-app-chart.labels" -}}
+app.kubernetes.io/name: {{ include "k8s-app-chart.name" . }}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/version: {{ .Chart.AppVersion }}
+{{- if .Values.color }} app: api
+color: {{ .Values.color | quote }} {{- end }}
+{{- end }}
+
+{{/* Used to trigger rollout when config/secret change */}}
+{{- define "k8s-app-chart.configChecksum" -}}
+{{- if .Values.config.enabled -}}
+{{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+{{- end -}}
+{{- end }}
+
+{{- define "k8s-app-chart.secretChecksum" -}}
+{{- if .Values.secret.enabled -}}
+{{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+{{- end -}}
+{{- end }}
+```
+
+---
+
+# templates/deployment.yaml
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}
+  labels:
+    {{- include "k8s-app-chart.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.deploymentAnnotations | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "k8s-app-chart.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- if .Values.color }} color: {{ .Values.color | quote }} {{- end }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  template:
+    metadata:
+      labels:
+        {{- include "k8s-app-chart.labels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "k8s-app-chart.configChecksum" . | quote }}
+        checksum/secret: {{ include "k8s-app-chart.secretChecksum" . | quote }}
+        {{- toYaml .Values.podAnnotations | nindent 8 }}
+    spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ include "k8s-app-chart.fullname" . }}
+      {{- else if .Values.serviceAccount.name }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- end }}
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        {{- if .Values.extraInitContainers }}
+        {{- toYaml .Values.extraInitContainers | nindent 8 }}
+        {{- end }}
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports: [{ containerPort: {{ .Values.service.targetPort }}, name: http }]
+          env:
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          envFrom:
+            {{- range .Values.envFromSecret }}
+            - secretRef: { name: {{ . | quote }} }
+            {{- end }}
+          volumeMounts:
+            {{- if .Values.config.enabled }}
+            - name: app-config
+              mountPath: /etc/app
+            {{- end }}
+            {{- if .Values.extraVolumeMounts }}
+            {{- toYaml .Values.extraVolumeMounts | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          startupProbe:
+            {{- toYaml .Values.probes.startup | nindent 12 }}
+        {{- if .Values.extraContainers }}
+        {{- toYaml .Values.extraContainers | nindent 8 }}
+        {{- end }}
+      volumes:
+        {{- if .Values.config.enabled }}
+        - name: app-config
+          projected:
+            sources:
+              - configMap:
+                  name: {{ include "k8s-app-chart.fullname" . }}
+              {{- if .Values.secret.enabled }}
+              - secret:
+                  name: {{ include "k8s-app-chart.fullname" . }}
+              {{- end }}
+        {{- end }}
+        {{- if .Values.extraVolumes }}
+        {{- toYaml .Values.extraVolumes | nindent 8 }}
+        {{- end }}
+```
+
+---
+
+# templates/service.yaml
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}-svc
+  labels:
+    {{- include "k8s-app-chart.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.service.annotations | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "k8s-app-chart.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- if .Values.color }} color: {{ .Values.color | quote }} {{- end }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+```
+
+---
+
+# templates/ingress.yaml
+
+```yaml
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}
+  labels:
+    {{- include "k8s-app-chart.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.ingress.annotations | nindent 4 }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  tls:
+    {{- toYaml .Values.ingress.tls | nindent 4 }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ include "k8s-app-chart.fullname" $ }}-svc
+                port: { number: {{ $.Values.service.port }} }
+          {{- end }}
+    {{- end }}
+{{- end }}
+```
+
+---
+
+# templates/hpa.yaml
+
+```yaml
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}
+  labels:
+    {{- include "k8s-app-chart.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "k8s-app-chart.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    {{- toYaml .Values.autoscaling.metrics | nindent 4 }}
+{{- end }}
+```
+
+---
+
+# templates/pdb.yaml
+
+```yaml
+{{- if .Values.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}
+  labels:
+    {{- include "k8s-app-chart.labels" . | nindent 4 }}
+spec:
+  {{- if hasKey .Values.pdb "minAvailable" }}
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  {{- else if hasKey .Values.pdb "maxUnavailable" }}
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "k8s-app-chart.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+```
+
+---
+
+# templates/configmap.yaml
+
+```yaml
+{{- if .Values.config.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}
+  labels:
+    {{- include "k8s-app-chart.labels" . | nindent 4 }}
+data:
+  {{- range $k, $v := .Values.config.data }}
+  {{ $k }}: |
+{{ $v | indent 4 }}
+  {{- end }}
+{{- end }}
+```
+
+# templates/secret.yaml
+
+```yaml
+{{- if .Values.secret.enabled }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}
+  labels:
+    {{- include "k8s-app-chart.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{- toYaml .Values.secret.stringData | nindent 2 }}
+{{- end }}
+```
+
+---
+
+# templates/networkpolicy.yaml
+
+```yaml
+{{- if .Values.networkPolicy.enabled }}
+{{- if .Values.networkPolicy.defaultDeny }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}-default-deny
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress","Egress"]
+---
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}-rules
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "k8s-app-chart.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: ["Ingress","Egress"]
+  ingress:
+    - from:
+        {{- range .Values.networkPolicy.allowNamespaceSelectors }}
+        - namespaceSelector: {{- toYaml . | nindent 12 }}
+        {{- end }}
+        {{- range .Values.networkPolicy.allowFromPods }}
+        - podSelector: {{- toYaml . | nindent 12 }}
+        {{- end }}
+  egress:
+    - to:
+        {{- range .Values.networkPolicy.egressCIDRs }}
+        - ipBlock: { cidr: {{ . | quote }} }
+        {{- end }}
+      ports:
+        {{- range .Values.networkPolicy.allowToPorts }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .port }}
+        {{- end }}
+{{- end }}
+```
+
+---
+
+# templates/serviceaccount.yaml
+
+```yaml
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}
+  annotations:
+    {{- toYaml .Values.serviceAccount.annotations | nindent 4 }}
+automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken | default false }}
+{{- end }}
+```
+
+# templates/rbac.yaml
+
+```yaml
+{{- if and .Values.rbac.create .Values.serviceAccount.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}-reader
+rules:
+  {{- toYaml .Values.rbac.rulesReadOnly | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "k8s-app-chart.fullname" . }}
+roleRef:
+  kind: Role
+  name: {{ include "k8s-app-chart.fullname" . }}-reader
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+```
+
+---
+
+# templates/servicemonitor.yaml
+
+```yaml
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "k8s-app-chart.fullname" . }}
+  labels:
+    {{- include "k8s-app-chart.labels" . | nindent 4 }}
+    {{- toYaml .Values.serviceMonitor.labels | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "k8s-app-chart.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  endpoints:
+    - port: http
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      path: /metrics
+{{- end }}
+```
+
+---
+
+# templates/NOTES.txt
+
+```txt
+1) Service:
+   kubectl -n {{ .Release.Namespace }} get svc {{ include "k8s-app-chart.fullname" . }}-svc
+
+2) Ingress (if enabled):
+   kubectl -n {{ .Release.Namespace }} get ingress {{ include "k8s-app-chart.fullname" . }}
+
+3) HPA:
+   kubectl -n {{ .Release.Namespace }} get hpa {{ include "k8s-app-chart.fullname" . }}
+
+4) Rollout status:
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "k8s-app-chart.fullname" . }}
+```
+
+---
+
+## Install & use
+
+```bash
+# From chart root
+helm lint .
+
+# Dry-run / render
+helm template myapp ./k8s-app-chart \
+  --namespace prod --create-namespace \
+  -f values.yaml
+
+# Install (dev defaults)
+helm upgrade --install myapp ./k8s-app-chart -n dev
+
+# Install with prod overrides
+helm upgrade --install myapp ./k8s-app-chart -n prod -f values-prod.yaml
+
+# Check rollout
+kubectl -n prod rollout status deploy/myapp-k8s-app-chart
+
+# Scale via values or temporarily
+kubectl -n prod scale deploy/myapp-k8s-app-chart --replicas=10
+```
+
+---
+
+## Blue/Green & Canary
+
+* **Blue/Green**: flip `.Values.color` from `blue` → `green`. Your `Service` selector includes `color`, so cutover is instant.
+* **Canary with NGINX Ingress**: add to `ingress.annotations`:
+
+```yaml
+nginx.ingress.kubernetes.io/canary: "true"
+nginx.ingress.kubernetes.io/canary-weight: "20"
+```
+
+---
+
+## Notes & prerequisites
+
+* **HPA custom metrics** require a metrics adapter (e.g., Prometheus Adapter) if you enable the Pods metric example.
+* **ServiceMonitor** requires the Prometheus Operator CRDs installed.
+* **NetworkPolicy** enforcement needs a CNI that supports it (Calico/Cilium/Weave, etc.).
+* **PSA**: Add namespace labels when you create the `prod` namespace:
+
+  ```bash
+  kubectl create ns prod
+  kubectl label ns prod pod-security.kubernetes.io/enforce=restricted \
+      pod-security.kubernetes.io/enforce-version=latest
+  ```
+
+---
+
+If you want, I can tailor this chart to **EKS (gp3 StorageClass, IRSA), AKS (Azure Workload Identity), or GKE (Workload Identity)** and wire in CI/CD (GitHub Actions/Jenkins) to push checksumed releases automatically.
+
